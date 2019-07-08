@@ -41,7 +41,6 @@ TsdfServer::TsdfServer(const ros::NodeHandle& nh,
       cluster_distance_threshold_(1),
       cluster_match_vote_threshold_(5),
       cluster_min_size_threshold_(5),
-      clustering_queue_size_(5),
       dynamic_recognizer_queue_size_(5),
       delta_distance_threshold_(0.02),
       dynamic_share_threshold_(0.2)
@@ -55,18 +54,26 @@ TsdfServer::TsdfServer(const ros::NodeHandle& nh,
   tsdf_pointcloud_pub_ =
       nh_private_.advertise<pcl::PointCloud<pcl::PointXYZI> >("tsdf_pointcloud",
                                                               1, true);
-  tsdf_newly_occupied_pointcloud_pub_ =
-      nh_private_.advertise<pcl::PointCloud<pcl::PointXYZI> >("tsdf_newly_occupied_slice",
-                                                              1, true);
-  tsdf_newly_occupied_distance_pointcloud_pub_ =
-      nh_private_.advertise<pcl::PointCloud<pcl::PointXYZI> >("tsdf_newly_occupied_distance_slice",
+  tsdf_oneshot_pointcloud_pub_ =
+      nh_private_.advertise<pcl::PointCloud<pcl::PointXYZI> >("tsdf_oneshot_pointcloud",
                                                               1, true);
   clustered_pointcloud_pub_ = 
       nh_private_.advertise<pcl::PointCloud<pcl::PointXYZRGB> >("clustered_pointcloud", 1, true);
+
   dynamic_pointcloud_pub_ = 
       nh_private_.advertise<pcl::PointCloud<pcl::PointXYZRGB> >("dynamic_pointcloud", 1, true);
+
   static_pointcloud_pub_ = 
       nh_private_.advertise<pcl::PointCloud<pcl::PointXYZRGB> >("static_pointcloud", 1, true);
+
+  dynamic_map_pointcloud_pub_ = 
+      nh_private_.advertise<pcl::PointCloud<pcl::PointXYZRGB> >("dynamic_map_pointcloud", 1, true);
+
+  static_map_pointcloud_pub_ = 
+      nh_private_.advertise<pcl::PointCloud<pcl::PointXYZRGB> >("static_map_pointcloud", 1, true);
+
+  delta_distance_pointcloud_pub_ = 
+      nh_private_.advertise<pcl::PointCloud<pcl::PointXYZRGB> >("delta_distance_pointcloud", 1, true);
 
   occupancy_marker_pub_ =
       nh_private_.advertise<visualization_msgs::MarkerArray>("occupied_nodes",
@@ -76,8 +83,12 @@ TsdfServer::TsdfServer(const ros::NodeHandle& nh,
 
   nh_private_.param("pointcloud_queue_size", pointcloud_queue_size_,
                     pointcloud_queue_size_);
-  pointcloud_sub_ = nh_.subscribe("pointcloud", pointcloud_queue_size_,
-                                  &TsdfServer::insertPointcloud, this);
+
+  pointcloud_left_sub_.subscribe(nh_, "pointcloud_left", 1);
+  pointcloud_right_sub_.subscribe(nh_, "pointcloud_right", 1);
+
+  sync_.reset(new Sync(MySyncPolicy(10), pointcloud_left_sub_, pointcloud_right_sub_));
+  sync_->registerCallback(boost::bind(&TsdfServer::insertPointcloud, this, _1, _2));
 
   mesh_pub_ = nh_private_.advertise<voxblox_msgs::Mesh>("mesh", 1, true);
 
@@ -108,12 +119,16 @@ TsdfServer::TsdfServer(const ros::NodeHandle& nh,
 
   // Initialize TSDF Map and integrator.
   tsdf_map_.reset(new TsdfMap(config));
+  tsdf_oneshot_map_.reset(new TsdfMap(config));
+  tsdf_map_delta_distance_.reset(new TsdfMap(config));
 
   std::string method("merged");
   nh_private_.param("method", method, method);
   if (method.compare("simple") == 0) {
     tsdf_integrator_.reset(new SimpleTsdfIntegrator(
         integrator_config, tsdf_map_->getTsdfLayerPtr()));
+    tsdf_oneshot_integrator_.reset(new SimpleTsdfIntegrator(
+        integrator_config, tsdf_oneshot_map_->getTsdfLayerPtr()));
   } else if (method.compare("merged") == 0) {
     tsdf_integrator_.reset(new MergedTsdfIntegrator(
         integrator_config, tsdf_map_->getTsdfLayerPtr()));
@@ -126,8 +141,8 @@ TsdfServer::TsdfServer(const ros::NodeHandle& nh,
   }
 
   //Vinz
-  clustering_.reset(new Clustering(tsdf_map_, cluster_distance_threshold_, cluster_match_vote_threshold_, cluster_min_size_threshold_, clustering_queue_size_));
-  dynamic_recognizer_.reset(new DynamicRecognizer(tsdf_map_, delta_distance_threshold_, dynamic_share_threshold_));
+  clustering_.reset(new Clustering(tsdf_oneshot_map_, cluster_distance_threshold_, cluster_match_vote_threshold_, cluster_min_size_threshold_));
+  dynamic_recognizer_.reset(new DynamicRecognizer(tsdf_oneshot_map_, delta_distance_threshold_, dynamic_share_threshold_));
 
   mesh_layer_.reset(new MeshLayer(tsdf_map_->block_size()));
 
@@ -209,9 +224,6 @@ void TsdfServer::getServerConfigFromRosParam(
   nh_private.param("cluster_min_size_threshold",
                    cluster_min_size_threshold_,
                    cluster_min_size_threshold_);
-  nh_private.param("clustering_queue_size",
-                   clustering_queue_size_, 
-                   clustering_queue_size_);
   nh_private.param("dynamic_recognizer_queue_size",
                    dynamic_recognizer_queue_size_,
                    dynamic_recognizer_queue_size_);
@@ -255,527 +267,22 @@ void TsdfServer::getServerConfigFromRosParam(
   color_map_->setMaxValue(intensity_max_value);
 }
 
-Queue::Queue() {
-  last = nullptr;
-  queue_size = 0;
-}
-
-void Queue::push(TsdfMap::Ptr tsdf_map){
-  Member* new_member = new Member;
-  new_member->tsdf_ptr = tsdf_map;
-  new_member->next = last;
-  last = new_member;
-  queue_size++;
-}
-
-TsdfMap::Ptr Queue::front() {
-  Member* current = last;
-  while(current->next != nullptr) {
-    current = current->next;
-  }
-  return current->tsdf_ptr;
-}
-
-void Queue::pop() {
-  Member* current = last;
-  while(current->next->next != nullptr) {
-    current = current->next;
-  }
-  delete current->next;
-  current->next = nullptr;
-  queue_size--;
-}
-
-int Queue::size() {
-  return queue_size;
-}
-
-Clustering::Clustering(const std::shared_ptr<TsdfMap> input_map, float cluster_distance_threshold, 
-                       unsigned int cluster_match_vote_threshold, unsigned int cluster_min_size_threshold,
-                       unsigned int clustering_queue_size) {
-  current_map_.reset(new TsdfMap(input_map->getTsdfLayer()));
-  //layer_.reset(current_map_->getTsdfLayerPtr());
-  cluster_distance_threshold_ = cluster_distance_threshold * current_map_->getTsdfLayerPtr()->voxel_size() / 2;
-  cluster_match_vote_threshold_ = cluster_match_vote_threshold; //number of voxels which need to have voted for a cluster for a match
-  cluster_min_size_threshold_ = cluster_min_size_threshold;
-  clustering_queue_size_ = clustering_queue_size;
-  voxels_per_side_ = current_map_->getTsdfLayerPtr()->voxels_per_side();
-  num_voxels_per_block_ = voxels_per_side_ * voxels_per_side_ * voxels_per_side_;
-}
-
-void Clustering::addCurrentMap(const std::shared_ptr<TsdfMap> input_map) {
-  current_map_.reset(new TsdfMap(input_map->getTsdfLayer()));
-  std::list<ColoredDynamicCluster> cluster_list;
-  cluster_list.clear();
-  Neighborhood<>::IndexMatrix neighbors;
-
-  BlockIndexList blocks;
-  current_map_->getTsdfLayerPtr()->getAllAllocatedBlocks(&blocks);
-
-  for (const BlockIndex& index : blocks) {
-    const Block<TsdfVoxel>& block = current_map_->getTsdfLayerPtr()->getBlockByIndex(index);
-    for (size_t linear_index = 0; linear_index < num_voxels_per_block_;
-         ++linear_index) {
-      TsdfVoxel voxel = block.getVoxelByLinearIndex(linear_index);
-      if (voxel.weight != 0 && voxel.distance < cluster_distance_threshold_) {
-        LongIndexSet current_cluster;
-        current_cluster.clear();
-        VoxelIndex voxel_index = block.computeVoxelIndexFromLinearIndex(linear_index);
-        GlobalIndex global_voxel_index = getGlobalVoxelIndexFromBlockAndVoxelIndex(index, voxel_index, voxels_per_side_);
-        current_cluster.insert(global_voxel_index);
-        voxel.weight = 0;
-        std::queue<GlobalIndex> global_index_voxel_queue;
-        global_index_voxel_queue.push(global_voxel_index);
-        while(!global_index_voxel_queue.empty()) {
-          GlobalIndex cluster_voxel_gi = global_index_voxel_queue.front();
-          Neighborhood<>::getFromGlobalIndex(cluster_voxel_gi, &neighbors);
-          for (unsigned int i = 0; i < Connectivity::kTwentySix; i++) {
-            GlobalIndex neighbor_global_index = neighbors.col(i);
-            TsdfVoxel* neighbor_voxel_ptr = current_map_->getTsdfLayerPtr()->getVoxelPtrByGlobalIndex(neighbor_global_index);
-            if (neighbor_voxel_ptr == nullptr) continue;
-            if (neighbor_voxel_ptr->weight != 0 && neighbor_voxel_ptr->distance < cluster_distance_threshold_) {
-              current_cluster.insert(neighbor_global_index);
-              global_index_voxel_queue.push(neighbor_global_index);
-              neighbor_voxel_ptr->weight = 0;
-            }
-          }
-          global_index_voxel_queue.pop();
-        }
-        if (current_cluster.size() > cluster_min_size_threshold_) {
-          ColoredDynamicCluster current_colored_cluster;
-          if (cluster_queue_.size() < (clustering_queue_size_ - 1)) {
-            Color color = colors[cluster_list.size() + 1];
-            current_colored_cluster = {current_cluster , color, false};
-          }
-          else current_colored_cluster = {current_cluster , Color::White(), false};
-          
-          /*if (current_colored_cluster.color == Color::Red()){
-            ROS_INFO("red");
-          } else if (current_colored_cluster.color == Color::Green()){
-            ROS_INFO("green");
-          } else if (current_colored_cluster.color == Color::Blue()){
-            ROS_INFO("blue");
-          } else if (current_colored_cluster.color == Color::White()){
-            ROS_INFO("white");
-          }*/
-          cluster_list.push_back(current_colored_cluster);
-        }
-      }
-    }
-  }
-  cluster_queue_.push(cluster_list);
-  /*std::list<ColoredDynamicCluster> cluster_list_test = cluster_queue_.back();
-  ColoredDynamicCluster cluster = cluster_list_test.front();
-  if (cluster.color == Color::Red()){
-    ROS_INFO("red");
-  } else if (cluster.color == Color::Green()){
-    ROS_INFO("green");
-  } else if (cluster.color == Color::Blue()){
-    ROS_INFO("blue");
-  } else if (cluster.color == Color::White()){
-    ROS_INFO("white");
-  }*/
-}
-
-/*std::shared_ptr<std::list<LongIndexSet>> Clustering::extractClusters() {
-  cluster_list_.reset(new std::list<LongIndexSet>);
-  cluster_list_->clear();
-  //current_cluster_.reset(new std::list<GlobalIndex>);
-  Neighborhood<>::IndexMatrix neighbors;
-  const size_t num_voxels_per_block = voxels_per_side_ * voxels_per_side_ * voxels_per_side_;
-  BlockIndexList blocks;
-  current_map_->getTsdfLayerPtr()->getAllAllocatedBlocks(&blocks);
-
-  for (const BlockIndex& index : blocks) {
-    const Block<TsdfVoxel>& block = current_map_->getTsdfLayerPtr()->getBlockByIndex(index);
-    for (size_t linear_index = 0; linear_index < num_voxels_per_block;
-         ++linear_index) {
-      TsdfVoxel voxel = block.getVoxelByLinearIndex(linear_index);
-      if (voxel.weight != 0 && voxel.distance < distance_threshold_) {
-        LongIndexSet current_cluster_;
-        current_cluster_.clear();
-        VoxelIndex voxel_index = block.computeVoxelIndexFromLinearIndex(linear_index);
-        GlobalIndex global_voxel_index = getGlobalVoxelIndexFromBlockAndVoxelIndex(index, voxel_index, voxels_per_side_);
-        current_cluster_.insert(global_voxel_index);
-        voxel.weight = 0;
-        std::queue<GlobalIndex> global_index_voxel_queue;
-        global_index_voxel_queue.push(global_voxel_index);
-        while(!global_index_voxel_queue.empty()) {
-          GlobalIndex cluster_voxel_gi = global_index_voxel_queue.front();
-          Neighborhood<>::getFromGlobalIndex(cluster_voxel_gi, &neighbors);
-          for (unsigned int i = 0; i < Connectivity::kTwentySix; i++) {
-            GlobalIndex neighbor_global_index = neighbors.col(i);
-            TsdfVoxel* neighbor_voxel_ptr = current_map_->getTsdfLayerPtr()->getVoxelPtrByGlobalIndex(neighbor_global_index);
-            if (neighbor_voxel_ptr == nullptr) continue;
-            if (neighbor_voxel_ptr->weight != 0 && neighbor_voxel_ptr->distance < distance_threshold_) {
-              current_cluster_.insert(neighbor_global_index);
-              global_index_voxel_queue.push(neighbor_global_index);
-              neighbor_voxel_ptr->weight = 0;
-            }
-          }
-          global_index_voxel_queue.pop();
-        }
-        if (current_cluster_.size() > cluster_match_vote_threshold_) {
-          cluster_list_->push_back(current_cluster_);
-        }
-      }
-    }
-  }
-  return cluster_list_;
-}*/
-
-void Clustering::matchCommunClusters() {
- std::list<ColoredDynamicCluster>* current_clusters = &(cluster_queue_.back());
- std::list<ColoredDynamicCluster>* old_clusters = &(cluster_queue_.front());
-
-	const int size = current_clusters->size();
-
-  bool* used_colors = new bool[9];
-  for (int i = 0; i<9; i++) used_colors[i] = false;
-	
-	for (ColoredDynamicCluster old_color_cluster : *old_clusters) {
-    unsigned int* current_cluster_vote_array = new unsigned int[size];
-	  for (int i = 0; i < size; i++) current_cluster_vote_array[i] = 0;
-    LongIndexSet old_cluster = old_color_cluster.cluster;
-    //Vote of old voxels for a current_cluster
-		for (auto old_voxel_global_index = old_cluster.begin(); old_voxel_global_index != old_cluster.end(); old_voxel_global_index++) {
-			//Point voxel_coord = voxel_element.coord;
-			int cluster_count = 0;
-			for (const ColoredDynamicCluster current_color_cluster : *current_clusters) {
-        LongIndexSet current_cluster = current_color_cluster.cluster;
-        if (current_cluster.find(*old_voxel_global_index) != current_cluster.end()){
-          current_cluster_vote_array[cluster_count] += 1;
-          break;
-        }
-				cluster_count += 1;
-			}
-		}
-    //matching current_cluster to old_cluster
-		std::list<ColoredDynamicCluster*> matched_current_clusters;
-		matched_current_clusters.clear();
-    int max_votes = 0;
-    ColoredDynamicCluster* base_current_color_cluster;
-    auto current_cluster_list_iterator = current_clusters->begin();
-		for (int i = 0; i < size; i++) {
-			if (current_cluster_vote_array[i] >= cluster_match_vote_threshold_) {
-				matched_current_clusters.push_back(&(*current_cluster_list_iterator));
-        if (current_cluster_vote_array[i] > max_votes) {
-          base_current_color_cluster = &(*current_cluster_list_iterator);
-          max_votes = current_cluster_vote_array[i];
-        }
-			}
-      current_cluster_list_iterator++;
-		}
-    LongIndexSet* base_current_cluster = &(base_current_color_cluster->cluster);
-
-    ROS_INFO("matched_current_cluster_count: %u", matched_current_clusters.size());
-
-    // If no matching has been made for this old_cluster
-    if (matched_current_clusters.size() == 0) continue;
-
-    // Checking if a matched_current_cluster has already been matched by another old_cluster
-    std::queue<ColoredDynamicCluster*> double_matched_current_clusters;
-    for (auto matched_current_cluster = matched_current_clusters.begin(); matched_current_cluster != matched_current_clusters.end(); matched_current_cluster++ ) {
-      /*if ((*matched_current_cluster)->color == Color::Red()){
-        ROS_INFO("red");
-      } else if ((*matched_current_cluster)->color == Color::Green()){
-        ROS_INFO("green");
-      } else if ((*matched_current_cluster)->color == Color::Blue()){
-        ROS_INFO("blue");
-      } else if ((*matched_current_cluster)->color == Color::White()){
-        ROS_INFO("white");
-      }*/
-      GlobalIndex matched_current_cluster_voxel = *((*matched_current_cluster)->cluster).begin();
-      for (auto current_color_cluster = current_clusters->begin(); current_color_cluster != current_clusters->end(); current_color_cluster++) {
-        if (current_color_cluster->color != colors[0] && current_color_cluster->cluster.find(matched_current_cluster_voxel) != current_color_cluster->cluster.end()) {
-          double_matched_current_clusters.push(&(*current_color_cluster));
-          ROS_INFO("double match activated");
-        }
-      }
-    }
-
-    // In case the current cluster is devided in several clusters
-    if (matched_current_clusters.size() > 1) {
-      //matched_current_clusters.erase(matched_current_clusters.begin());
-      for (auto matched_current_color_cluster = matched_current_clusters.begin(); matched_current_color_cluster != matched_current_clusters.end(); matched_current_color_cluster++ ) {
-        if (*matched_current_color_cluster == base_current_color_cluster) continue;
-        LongIndexSet* matched_current_cluster = &(*matched_current_color_cluster)->cluster;
-        for (auto voxel_global_index = matched_current_cluster->begin(); voxel_global_index != matched_current_cluster->end(); voxel_global_index++) {
-          base_current_cluster->insert(*voxel_global_index);
-        }
-        current_clusters->remove(**matched_current_color_cluster); //erase(iterator)
-      }
-    }
-    // Combining clusters if a matched_current_cluster has already been matched by another old_cluster
-    Color color_from_old = colors[0];
-    bool dynamic_tag_from_old = false;
-    while (!double_matched_current_clusters.empty()) {
-      ColoredDynamicCluster* previously_computed_double_matched_current_cluster = double_matched_current_clusters.front();
-      for (GlobalIndex previously_computed_current_voxel : previously_computed_double_matched_current_cluster->cluster) {
-        base_current_cluster->insert(previously_computed_current_voxel);
-      }
-      color_from_old = previously_computed_double_matched_current_cluster->color;
-      if (!dynamic_tag_from_old) dynamic_tag_from_old = previously_computed_double_matched_current_cluster->dynamic; 
-      /*for (auto current_cluster = current_clusters->begin(); current_cluster != current_clusters->end(); current_cluster++){
-        ROS_INFO("test 13");
-        if (current_cluster->cluster.find(*(previously_computed_double_matched_current_cluster->cluster.begin())) != current_cluster->cluster.end()) {
-            ROS_INFO("test 11");
-            current_clusters->erase(current_cluster);
-            ROS_INFO("test 10");
-            break;
-        }
-      }*/
-      current_clusters->remove(*previously_computed_double_matched_current_cluster);
-      double_matched_current_clusters.pop();
-    }
-    if (color_from_old != colors[0]) {
-      base_current_color_cluster->color = color_from_old;
-      base_current_color_cluster->dynamic = dynamic_tag_from_old;
-    } else {
-      base_current_color_cluster->color = old_color_cluster.color;
-      base_current_color_cluster->dynamic = old_color_cluster.dynamic;
-    }
-    if (base_current_color_cluster->color == Color::Red()){
-      ROS_INFO("red");
-    } else if (base_current_color_cluster->color == Color::Green()){
-      ROS_INFO("green");
-    } else if (base_current_color_cluster->color == Color::Blue()){
-      ROS_INFO("blue");
-    } else if (base_current_color_cluster->color == Color::White()){
-      ROS_INFO("white");
-    }
-    for (int i = 0; i < 9; i++){
-      if(base_current_color_cluster->color == colors[i]) used_colors[i] = true;
-    }
-    delete current_cluster_vote_array;
-	}
-  // check for current clusters with color white -> given them an unused color
-  for (auto current_color_cluster = current_clusters->begin(); current_color_cluster != current_clusters->end(); current_color_cluster++) {
-    if (current_color_cluster->color == Color::White()){
-      for (int i = 1; i<9 ; i++){
-        if(!used_colors[i]) {
-          current_color_cluster->color = colors[i];
-          used_colors[i] = true;
-          break;
-        }
-      }
-      if (current_color_cluster->color == Color::Red()){
-        ROS_INFO("red");
-      } else if (current_color_cluster->color == Color::Green()){
-        ROS_INFO("green");
-      } else if (current_color_cluster->color == Color::Blue()){
-        ROS_INFO("blue");
-      } else if (current_color_cluster->color == Color::White()){
-        ROS_INFO("white");
-      }
-    }
-  }
-
-  delete used_colors;
-}
-
-/* pcl::PointCloud<pcl::PointXYZRGB> Clustering::extractedClusterVisualiser() {
-  pcl::PointCloud<pcl::PointXYZRGB> pointcloud;
-  pointcloud.clear();
-  Color color;
-  Color color_array[] = {color.Red(), color.Green(), color.Blue(), color.Yellow(), color.Orange(), color.Purple(), color.Teal(), color.Pink()};
-  int color_counter = 0;
-  for (LongIndexSet cluster : *cluster_ _) {
-    color = color_array[color_counter % 8];
-    if (color_counter > 8) ROS_WARN ("overflowing colors for cluster pub");
-
-    for (auto voxel_global_index = cluster.begin(); voxel_global_index != cluster.end(); ++voxel_global_index) {
-      BlockIndex block_index ;
-      VoxelIndex voxel_index ;
-      getBlockAndVoxelIndexFromGlobalVoxelIndex(*voxel_global_index, voxels_per_side_, &block_index, &voxel_index);
-      const Block<TsdfVoxel>& block = current_map_->getTsdfLayerPtr()->getBlockByIndex(block_index);
-      Point voxel_coord = block.computeCoordinatesFromVoxelIndex(voxel_index);
-      pcl::PointXYZRGB point;
-      point.x = voxel_coord.x();
-      point.y = voxel_coord.y();
-      point.z = voxel_coord.z();
-      point.r = color.r;
-      point.g = color.g;
-      point.b = color.b;
-      pointcloud.push_back(point);
-    }
-    color_counter++;
-  }
-  return pointcloud;
-} */
-
-pcl::PointCloud<pcl::PointXYZRGB> Clustering::matchedClusterVisualiser() {
-  pcl::PointCloud<pcl::PointXYZRGB> pointcloud;
-  pointcloud.clear();
-  std::list<ColoredDynamicCluster>* current_clusters = &(cluster_queue_.back());
-  for (ColoredDynamicCluster colored_cluster : *current_clusters) {
-    LongIndexSet cluster = colored_cluster.cluster;
-    Color color = colored_cluster.color;
-    for (auto voxel_global_index = cluster.begin(); voxel_global_index != cluster.end(); ++voxel_global_index) {
-      BlockIndex block_index ;
-      VoxelIndex voxel_index ;
-      getBlockAndVoxelIndexFromGlobalVoxelIndex(*voxel_global_index, voxels_per_side_, &block_index, &voxel_index);
-      const Block<TsdfVoxel>& block = current_map_->getTsdfLayerPtr()->getBlockByIndex(block_index);
-      Point voxel_coord = block.computeCoordinatesFromVoxelIndex(voxel_index);
-      pcl::PointXYZRGB point;
-      point.x = voxel_coord.x();
-      point.y = voxel_coord.y();
-      point.z = voxel_coord.z();
-      point.r = color.r;
-      point.g = color.g;
-      point.b = color.b;
-      pointcloud.push_back(point);
-    }
-  }
-  return pointcloud;
-}
-
-DynamicRecognizer::DynamicRecognizer(const std::shared_ptr<TsdfMap> input_map, float delta_distance_threshold, float dynamic_share_threshold){
-  voxels_per_side_ = input_map->getTsdfLayerPtr()->voxels_per_side();
-  num_voxels_per_block_ = voxels_per_side_ * voxels_per_side_ * voxels_per_side_;
-  delta_distance_threshold_ = delta_distance_threshold;
-  dynamic_share_threshold_ = dynamic_share_threshold;
-}
-
-void DynamicRecognizer::addCurrentMap(const std::shared_ptr<TsdfMap> input_map) {
-  tsdf_ptr_queue_.push(input_map);
-}
-
-void DynamicRecognizer::dynamicRecognizing(std::list<ColoredDynamicCluster>* input_clusters){
-  std::shared_ptr<TsdfMap> current_map = tsdf_ptr_queue_.back();
-  std::shared_ptr<TsdfMap> old_map = tsdf_ptr_queue_.front();
-  current_clusters_ = input_clusters;
-  float voxels_per_side_inv = 1 / voxels_per_side_;
-
-  for (auto current_color_cluster = current_clusters_->begin(); current_color_cluster != current_clusters_->end(); current_color_cluster++){
-    if (!current_color_cluster->dynamic){
-      LongIndexSet current_cluster = current_color_cluster->cluster;
-      int dynamic_counter = 0;
-      int total_count = 0;
-      for (GlobalIndex global_voxel_index : current_cluster){
-        TsdfVoxel* current_voxel = current_map->getTsdfLayerPtr()->getVoxelPtrByGlobalIndex(global_voxel_index);
-        BlockIndex block_index = getBlockIndexFromGlobalVoxelIndex(global_voxel_index, voxels_per_side_inv);
-        if (old_map->getTsdfLayerPtr()->hasBlock(block_index)) {
-          TsdfVoxel* old_voxel = old_map->getTsdfLayerPtr()->getVoxelPtrByGlobalIndex(global_voxel_index);
-          if (old_voxel != nullptr) {
-            if (old_voxel->weight != 0) {
-              float delta_distance = std::abs(current_voxel->distance - old_voxel->distance);
-              //ROS_INFO("delta_distance = %f", delta_distance);
-              total_count++;
-              if (delta_distance > delta_distance_threshold_) dynamic_counter++;
-            }
-          }
-        }
-      }
-      if (total_count > 0){
-        float dynamic_share = dynamic_counter/total_count;
-        //ROS_INFO("dynamic_share = %f", dynamic_share);
-        if (dynamic_share > dynamic_share_threshold_) current_color_cluster->dynamic = true;      
-      }
-    }
-  }
-}
-
-void DynamicRecognizer::dynamicClusterVisualiser(pcl::PointCloud<pcl::PointXYZRGB>* dynamic_pointcloud, 
-                                                 pcl::PointCloud<pcl::PointXYZRGB>* static_pointcloud) {
-  dynamic_pointcloud->clear();
-  static_pointcloud->clear();
-  for (const ColoredDynamicCluster colored_cluster : *current_clusters_) {
-    LongIndexSet cluster = colored_cluster.cluster;
-    Color color = colored_cluster.color;
-    for (auto voxel_global_index = cluster.begin(); voxel_global_index != cluster.end(); ++voxel_global_index) {
-      BlockIndex block_index ;
-      VoxelIndex voxel_index ;
-      //ROS_INFO("test_2");
-      getBlockAndVoxelIndexFromGlobalVoxelIndex(*voxel_global_index, voxels_per_side_, &block_index, &voxel_index);
-      const Block<TsdfVoxel>& block = tsdf_ptr_queue_.back()->getTsdfLayerPtr()->getBlockByIndex(block_index);
-      Point voxel_coord = block.computeCoordinatesFromVoxelIndex(voxel_index);
-      pcl::PointXYZRGB point;
-      point.x = voxel_coord.x();
-      point.y = voxel_coord.y();
-      point.z = voxel_coord.z();
-      point.r = color.r;
-      point.g = color.g;
-      point.b = color.b;
-      if(colored_cluster.dynamic){
-        dynamic_pointcloud->push_back(point);
-      } else {
-        static_pointcloud->push_back(point);
-      }
-    }
-  }
-}
-
-void TsdfServer::createNewlyOccupiedMap(const TsdfMap::Ptr current_map, 
-      TsdfMap::Ptr old_map, TsdfMap::Ptr newly_occupied_map, TsdfMap::Ptr newly_occupied_map_distance){
-  
-  const size_t vps = current_map->getTsdfLayerPtr()->voxels_per_side();
-  const size_t num_voxels_per_block = vps * vps * vps;
-  const float distance_threshold = 0.1;
-
-  BlockIndexList blocks_current;
-  current_map->getTsdfLayerPtr()->getAllAllocatedBlocks(&blocks_current);
-
-  for (const BlockIndex& index : blocks_current) {
-    // Iterate over all voxels in current blocks.
-    const Block<TsdfVoxel>& block_current = current_map->getTsdfLayerPtr()->getBlockByIndex(index);
-
-    for (size_t linear_index = 0; linear_index < num_voxels_per_block;
-         ++linear_index) {
-      //ROS_INFO("Going through voxel indexes");
-      const Point coord = block_current.computeCoordinatesFromLinearIndex(linear_index);
-      const TsdfVoxel& voxel_current = block_current.getVoxelByLinearIndex(linear_index);
-      TsdfVoxel* voxel_newly_occupied = newly_occupied_map->getTsdfLayerPtr()->getVoxelPtrByCoordinates(coord);
-      TsdfVoxel* voxel_newly_occupied_distance = newly_occupied_map_distance->getTsdfLayerPtr()->getVoxelPtrByCoordinates(coord);
-      const TsdfVoxel* voxel_old = old_map->getTsdfLayerPtr()->getVoxelPtrByCoordinates(coord);
-      if (voxel_old == nullptr) {
-        //ROS_INFO("NOM: voxel_old = nullptr");
-        voxel_newly_occupied->weight = 0;
-        voxel_newly_occupied_distance->weight = 0;
-        continue;
-      }
-
-      voxel_newly_occupied_distance->distance = voxel_current.distance - voxel_old->distance;
-
-      if (std::abs(voxel_current.distance) < distance_threshold && voxel_current.weight != 0) {
-        if (std::abs(voxel_old->distance) < distance_threshold || voxel_old->weight == 0) {
-          //delete voxel in newly_occupied_map
-          voxel_newly_occupied->weight = 0;
-        }
-      } 
-      else {
-          voxel_newly_occupied->weight = 0;
-      }
-    }
-  }  
-}
-
 void TsdfServer::processPointCloudMessageAndInsert(
-    const sensor_msgs::PointCloud2::Ptr& pointcloud_msg,
+    const sensor_msgs::PointCloud2ConstPtr& pointcloud_msg,
     const Transformation& T_G_C, const bool is_freespace_pointcloud) {
   // Convert the PCL pointcloud into our awesome format.
-
-  //Allows only for SimpleTsdfIntegrator and does not allow to output a mesh
-  TsdfMap::Config config;
-  config.tsdf_voxel_size = tsdf_map_->getTsdfLayerPtr()->voxel_size();
-  config.tsdf_voxels_per_side = tsdf_map_->getTsdfLayerPtr()->voxels_per_side();
-  tsdf_map_.reset(new TsdfMap(config));
-
-  const TsdfIntegratorBase::Config integrator_config = tsdf_integrator_->getConfig();
-  tsdf_integrator_.reset(new SimpleTsdfIntegrator(
-        integrator_config, tsdf_map_->getTsdfLayerPtr()));
 
   // Horrible hack fix to fix color parsing colors in PCL.
   bool color_pointcloud = false;
   bool has_intensity = false;
-  for (size_t d = 0; d < pointcloud_msg->fields.size(); ++d) {
+  /*for (size_t d = 0; d < pointcloud_msg->fields.size(); ++d) {
     if (pointcloud_msg->fields[d].name == std::string("rgb")) {
       pointcloud_msg->fields[d].datatype = sensor_msgs::PointField::FLOAT32;
       color_pointcloud = true;
     } else if (pointcloud_msg->fields[d].name == std::string("intensity")) {
       has_intensity = true;
     }
-  }
+  }*/
 
   Pointcloud points_C;
   Colors colors;
@@ -856,54 +363,20 @@ void TsdfServer::processPointCloudMessageAndInsert(
   integratePointcloud(T_G_C_refined, points_C, colors, is_freespace_pointcloud);
   ros::WallTime end = ros::WallTime::now();
   if (verbose_) {
-    ROS_INFO("Finished integrating in %f seconds, have %lu blocks.",
+    ROS_INFO("Finished integrating in %f seconds, have %lu blocks, have %lu blocks one shot.",
              (end - start).toSec(),
-             tsdf_map_->getTsdfLayer().getNumberOfAllocatedBlocks());
+             tsdf_map_->getTsdfLayer().getNumberOfAllocatedBlocks(),
+             tsdf_oneshot_map_->getTsdfLayer().getNumberOfAllocatedBlocks());
   }
 
   timing::Timer block_remove_timer("remove_distant_blocks");
   tsdf_map_->getTsdfLayerPtr()->removeDistantBlocks(
       T_G_C.getPosition(), max_block_distance_from_body_);
+  tsdf_oneshot_map_->getTsdfLayerPtr()->removeDistantBlocks(
+      T_G_C.getPosition(), max_block_distance_from_body_);
   mesh_layer_->clearDistantMesh(T_G_C.getPosition(),
                                 max_block_distance_from_body_);
   block_remove_timer.Stop();
-
-  //Vinz: starting my part now 
-  //TsdfMap::Ptr new_map (new TsdfMap(tsdf_map_->getTsdfLayer()));
-  //new_map.reset(new ); 
-
-  //queue_.push(new_map);
-  clustering_->addCurrentMap(tsdf_map_);
-  dynamic_recognizer_->addCurrentMap(tsdf_map_);
-  cluster_matching_active_ = false;
-  dynamic_recognizing_active_ = false;
-  ROS_INFO("tsdf map queue size %u", dynamic_recognizer_->getMapQueueSize());
-  while (clustering_->getClusterQueueSize() > clustering_queue_size_) {
-    clustering_->popfromQueue();
-  }
-  while (dynamic_recognizer_->getMapQueueSize() > dynamic_recognizer_queue_size_) {
-    dynamic_recognizer_->popfromQueue();
-  }
-
-  if (clustering_->getClusterQueueSize() == clustering_queue_size_) {
-    cluster_matching_active_ = true;
-    clustering_->matchCommunClusters();
-    clustered_pcl_ = clustering_->matchedClusterVisualiser();
-   // tsdf_map_newly_occupied_.reset(new TsdfMap(tsdf_map_->getTsdfLayer()));
-    //tsdf_map_newly_occupied_distance_.reset(new TsdfMap(tsdf_map_->getTsdfLayer()));
-    //createNewlyOccupiedMap(tsdf_map_, queue_.front(), tsdf_map_newly_occupied_, tsdf_map_newly_occupied_distance_);
-    //queue_.pop();
-    clustering_->popfromQueue();
-  }
-  if (dynamic_recognizer_->getMapQueueSize() == dynamic_recognizer_queue_size_) {
-    dynamic_recognizing_active_ = true;
-    tsdf_map_delta_distance_.reset(new TsdfMap(tsdf_map_->getTsdfLayer()));
-    dynamic_recognizer_->dynamicRecognizing(clustering_->getCurrentClustersPointer());
-    dynamic_recognizer_->dynamicClusterVisualiser(&dynamic_pcl_, &static_pcl_);
-    dynamic_recognizer_->popfromQueue();
-  }
-
-  ROS_INFO("-----------------------");
 
   // Callback for inheriting classes.
   newPoseCallback(T_G_C);
@@ -911,8 +384,8 @@ void TsdfServer::processPointCloudMessageAndInsert(
 
 // Checks if we can get the next message from queue.
 bool TsdfServer::getNextPointcloudFromQueue(
-    std::queue<sensor_msgs::PointCloud2::Ptr>* queue,
-    sensor_msgs::PointCloud2::Ptr* pointcloud_msg, Transformation* T_G_C) {
+    std::queue<sensor_msgs::PointCloud2ConstPtr>* queue,
+    sensor_msgs::PointCloud2ConstPtr* pointcloud_msg, Transformation* T_G_C) {
   const size_t kMaxQueueSize = 10;
   if (queue->empty()) {
     return false;
@@ -938,16 +411,27 @@ bool TsdfServer::getNextPointcloudFromQueue(
 }
 
 void TsdfServer::insertPointcloud(
-    const sensor_msgs::PointCloud2::Ptr& pointcloud_msg_in) {
-  if (pointcloud_msg_in->header.stamp - last_msg_time_ptcloud_ >
+    const sensor_msgs::PointCloud2ConstPtr& pointcloud_msg_left_in, const sensor_msgs::PointCloud2ConstPtr& pointcloud_msg_right_in) {
+  if (pointcloud_msg_left_in->header.stamp - last_msg_time_ptcloud_ >
       min_time_between_msgs_) {
-    last_msg_time_ptcloud_ = pointcloud_msg_in->header.stamp;
+    last_msg_time_ptcloud_ = pointcloud_msg_left_in->header.stamp;
     // So we have to process the queue anyway... Push this back.
-    pointcloud_queue_.push(pointcloud_msg_in);
+    pointcloud_queue_.push(pointcloud_msg_left_in);
+    pointcloud_queue_.push(pointcloud_msg_right_in);
   }
 
+  //Allows only for SimpleTsdfIntegrator and does not allow to output a mesh
+  TsdfMap::Config config;
+  config.tsdf_voxel_size = tsdf_oneshot_map_->getTsdfLayerPtr()->voxel_size();
+  config.tsdf_voxels_per_side = tsdf_oneshot_map_->getTsdfLayerPtr()->voxels_per_side();
+  tsdf_oneshot_map_.reset(new TsdfMap(config));
+
+  const TsdfIntegratorBase::Config integrator_config = tsdf_oneshot_integrator_->getConfig();
+  tsdf_oneshot_integrator_.reset(new SimpleTsdfIntegrator(
+        integrator_config, tsdf_oneshot_map_->getTsdfLayerPtr()));
+
   Transformation T_G_C;
-  sensor_msgs::PointCloud2::Ptr pointcloud_msg;
+  sensor_msgs::PointCloud2ConstPtr pointcloud_msg;
   bool processed_any = false;
   while (
       getNextPointcloudFromQueue(&pointcloud_queue_, &pointcloud_msg, &T_G_C)) {
@@ -961,6 +445,29 @@ void TsdfServer::insertPointcloud(
     return;
   }
 
+  //Vinz: starting my part now 
+  clustering_->addCurrentMap(tsdf_oneshot_map_);
+  dynamic_recognizer_->addCurrentMap(tsdf_oneshot_map_);
+  dynamic_recognizing_active_ = false;
+  //ROS_INFO("tsdf map queue size %u", dynamic_recognizer_->getMapQueueSize());
+  while (dynamic_recognizer_->getMapQueueSize() > dynamic_recognizer_queue_size_) {
+    dynamic_recognizer_->popfromQueue();
+  }
+
+  clustering_->determineFOV();
+  if (dynamic_recognizer_->getMapQueueSize() == dynamic_recognizer_queue_size_) {
+    dynamic_recognizing_active_ = true;
+    tsdf_map_delta_distance_.reset(new TsdfMap(tsdf_oneshot_map_->getTsdfLayer()));
+    dynamic_recognizer_->dynamicRecognizing(clustering_->getCurrentClustersPointer(), tsdf_map_delta_distance_);
+    dynamic_recognizer_->dynamicClusterVisualiser(&dynamic_pcl_, &static_pcl_);
+    dynamic_recognizer_->popfromQueue();
+  }
+  clustering_->matchCommunClusters();
+  //clustered_pcl_ = clustering_->matchedClusterVisualiser();
+  clustering_->mapClusterVisualiser(&dynamic_map_pcl_, &static_map_pcl_, tsdf_map_);
+  
+  ROS_INFO("-----------------------");
+
   if (publish_pointclouds_on_update_) {
     publishPointclouds();
   }
@@ -973,7 +480,7 @@ void TsdfServer::insertPointcloud(
 }
 
 void TsdfServer::insertFreespacePointcloud(
-    const sensor_msgs::PointCloud2::Ptr& pointcloud_msg_in) {
+    const sensor_msgs::PointCloud2ConstPtr& pointcloud_msg_in) {
   if (pointcloud_msg_in->header.stamp - last_msg_time_freespace_ptcloud_ >
       min_time_between_msgs_) {
     last_msg_time_freespace_ptcloud_ = pointcloud_msg_in->header.stamp;
@@ -982,7 +489,7 @@ void TsdfServer::insertFreespacePointcloud(
   }
 
   Transformation T_G_C;
-  sensor_msgs::PointCloud2::Ptr pointcloud_msg;
+  sensor_msgs::PointCloud2ConstPtr pointcloud_msg;
   while (getNextPointcloudFromQueue(&freespace_pointcloud_queue_,
                                     &pointcloud_msg, &T_G_C)) {
     constexpr bool is_freespace_pointcloud = true;
@@ -998,6 +505,8 @@ void TsdfServer::integratePointcloud(const Transformation& T_G_C,
   CHECK_EQ(ptcloud_C.size(), colors.size());
   tsdf_integrator_->integratePointCloud(T_G_C, ptcloud_C, colors,
                                         is_freespace_pointcloud);
+  tsdf_oneshot_integrator_->integratePointCloud(T_G_C, ptcloud_C, colors,
+                                        is_freespace_pointcloud);                                      
 }
 
 void TsdfServer::publishAllUpdatedTsdfVoxels() {
@@ -1006,6 +515,31 @@ void TsdfServer::publishAllUpdatedTsdfVoxels() {
   createDistancePointcloudFromTsdfLayer(tsdf_map_->getTsdfLayer(), &pointcloud);
   pointcloud.header.frame_id = world_frame_;
   tsdf_pointcloud_pub_.publish(pointcloud);
+
+  pcl::PointCloud<pcl::PointXYZI> pointcloud_oneshot;
+  createDistancePointcloudFromTsdfLayer(tsdf_oneshot_map_->getTsdfLayer(), &pointcloud_oneshot);
+  pointcloud_oneshot.header.frame_id = world_frame_;
+  tsdf_oneshot_pointcloud_pub_.publish(pointcloud_oneshot);
+
+  clustered_pcl_.header.frame_id = world_frame_;
+  clustered_pointcloud_pub_.publish(clustered_pcl_);
+
+  dynamic_map_pcl_.header.frame_id = world_frame_;
+  static_map_pcl_.header.frame_id = world_frame_;
+  dynamic_map_pointcloud_pub_.publish(dynamic_map_pcl_);
+  static_map_pointcloud_pub_.publish(static_map_pcl_);
+
+  if (dynamic_recognizing_active_) {
+    dynamic_pcl_.header.frame_id = world_frame_;
+    static_pcl_.header.frame_id = world_frame_;
+    dynamic_pointcloud_pub_.publish(dynamic_pcl_);
+    static_pointcloud_pub_.publish(static_pcl_);
+
+    pcl::PointCloud<pcl::PointXYZI> pointcloud_delta_distance;
+    createDistancePointcloudFromTsdfLayer(tsdf_map_delta_distance_->getTsdfLayer(), &pointcloud_delta_distance);
+    pointcloud_delta_distance.header.frame_id = world_frame_;
+    delta_distance_pointcloud_pub_.publish(pointcloud_delta_distance);
+  }
 }
 
 void TsdfServer::publishTsdfSurfacePoints() {
@@ -1035,29 +569,6 @@ void TsdfServer::publishSlices() {
                                              slice_level_, &pointcloud);
   pointcloud.header.frame_id = world_frame_;
   tsdf_slice_pub_.publish(pointcloud);
-
-  pcl::PointCloud<pcl::PointXYZI> pointcloud_newly_occupied;
-  pcl::PointCloud<pcl::PointXYZI> pointcloud_newly_occupied_distance;
-
-  if (cluster_matching_active_) {
-    /*createDistancePointcloudFromTsdfLayerSlice(tsdf_map_newly_occupied_->getTsdfLayer(), 2, slice_level_, &pointcloud_newly_occupied);
-    pointcloud_newly_occupied.header.frame_id = world_frame_;
-    tsdf_newly_occupied_pointcloud_pub_.publish(pointcloud_newly_occupied);
-
-    createDistancePointcloudFromTsdfLayerSlice(tsdf_map_newly_occupied_distance_->getTsdfLayer(), 2, slice_level_, &pointcloud_newly_occupied_distance);
-    pointcloud_newly_occupied_distance.header.frame_id = world_frame_;
-    tsdf_newly_occupied_distance_pointcloud_pub_.publish(pointcloud_newly_occupied_distance);
-    */
-    clustered_pcl_.header.frame_id = world_frame_;
-    clustered_pointcloud_pub_.publish(clustered_pcl_);
-  }
-
-  if (dynamic_recognizing_active_) {
-    dynamic_pcl_.header.frame_id = world_frame_;
-    static_pcl_.header.frame_id = world_frame_;
-    dynamic_pointcloud_pub_.publish(dynamic_pcl_);
-    static_pointcloud_pub_.publish(static_pcl_);
-  }
 }
 
 void TsdfServer::publishMap(bool reset_remote_map) {
@@ -1090,8 +601,8 @@ void TsdfServer::publishPointclouds() {
   // Combined function to publish all possible pointcloud messages -- surface
   // pointclouds, updated points, and occupied points.
   publishAllUpdatedTsdfVoxels();
-  publishTsdfSurfacePoints();
-  publishTsdfOccupiedNodes();
+  //publishTsdfSurfacePoints();
+  //publishTsdfOccupiedNodes();
   if (publish_slices_) {
     publishSlices();
   }

@@ -3,16 +3,16 @@
   <arg name="voxel_size" default="0.10"/>
 
   <node name="voxblox_node" pkg="voxblox_ros" type="tsdf_server" output="screen" args="-alsologtostderr" clear_params="true">
-    <remap from="pointcloud" to="/ifm3d/camera_left/cloud"/>
+    <remap from="pointcloud_left" to="/ifm3d/camera_left/cloud"/>
+    <remap from="pointcloud_right" to="/ifm3d/camera_right/cloud"/>
     <param name="publish_pointclouds" value="true" />
     <param name="publish_pointclouds_on_update" value="true" />
-    <param name="publish_slices" value="true" />
+    <param name="publish_slices" value="false" />
     <param name="slice_level" value="0.0" />
     <param name="publish_tsdf_info" value="true" />
     <param name="color_mode" value="color" />
     <param name="use_tf_transforms" value="true" />
     <param name="world_frame" value="map_floor" />
-    <param name="sensor_frame" value="ifm3d/camera_left_link" />
     <param name="tsdf_voxel_size" value="$(arg voxel_size)" />
     <param name="tsdf_voxels_per_side" value="16" />
     <param name="voxel_carving_enabled" value="true" />
@@ -27,12 +27,11 @@
     <param name="cluster_distance_threshold" value="1" />
     <param name="cluster_match_vote_threshold" value="1" />
     <param name="cluster_min_size_threshold" value="5" />
-    <param name="clustering_queue_size" value="2" /> 
-    <param name="dynamic_recognizer_queue_size" value="5" />
-    <param name="delta_distance_threshold" value="0.3" />
-    <param name="dynamic_share_threshold" value="0.5" />
-    
-      
+    <param name="dynamic_recognizer_queue_size" value="3" />
+    <param name="delta_distance_threshold" value="0.2" />
+    <param name="dynamic_share_threshold" value="0.6" />
+
+
 
   </node>
 
