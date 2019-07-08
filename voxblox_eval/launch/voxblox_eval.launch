@@ -1,0 +1,5 @@
+<launch>
+
+  <node pkg="voxblox_eval" type="voxblox_evaluation" name="voxblox_evaluation" output="screen" />
+
+</launch>
