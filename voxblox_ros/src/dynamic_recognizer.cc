@@ -44,17 +44,17 @@ void DynamicRecognizer::dynamicRecognizing(std::list<ColoredDynamicCluster>* inp
         if (old_voxel->weight != 0) {
           delta_distance = std::abs(current_voxel->distance - old_voxel->distance);
           delta_distance_voxel->distance = delta_distance;
-          ROS_INFO("delta_distance = %f, threshold = %f", delta_distance, delta_distance_threshold_);
+          //ROS_INFO("delta_distance = %f, threshold = %f", delta_distance, delta_distance_threshold_);
           //ROS_INFO("dynamic count = %u, total count = %u", dynamic_counter, total_count);
         } else {
           delta_distance = std::abs(current_voxel->distance);
           delta_distance_voxel->distance = delta_distance;
-          ROS_INFO("weight 0; delta_distance = %f, threshold = %f", delta_distance, delta_distance_threshold_);
+          //ROS_INFO("weight 0; delta_distance = %f, threshold = %f", delta_distance, delta_distance_threshold_);
         }
       } else {
         delta_distance = std::abs(current_voxel->distance);
         delta_distance_voxel->distance = delta_distance;
-        ROS_INFO("nullptr; delta_distance = %f, threshold = %f", delta_distance, delta_distance_threshold_);
+        //ROS_INFO("nullptr; delta_distance = %f, threshold = %f", delta_distance, delta_distance_threshold_);
       }
       total_count++;
       if (delta_distance > delta_distance_threshold_) {
@@ -63,7 +63,7 @@ void DynamicRecognizer::dynamicRecognizing(std::list<ColoredDynamicCluster>* inp
     }
     if (total_count > 0){
       float dynamic_share = dynamic_counter/total_count;
-      ROS_INFO("dynamic_share = %f, threshold = %f", dynamic_share, dynamic_share_threshold_);
+      //ROS_INFO("dynamic_share = %f, threshold = %f", dynamic_share, dynamic_share_threshold_);
       if (dynamic_share > dynamic_share_threshold_) current_color_cluster->dynamic = true;
     }
   }

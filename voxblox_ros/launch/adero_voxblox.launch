@@ -21,7 +21,7 @@
     <param name="method" value="simple" />
     <param name="use_const_weight" value="false" />
     <param name="allow_clear" value="true" />
-    <param name="verbose" value="false" />
+    <param name="verbose" value="true" />
     <rosparam file="$(find voxblox_ros)/cfg/cow_and_lady.yaml"/>
     <param name="mesh_filename" value="" />
     <param name="cluster_distance_threshold" value="1" />

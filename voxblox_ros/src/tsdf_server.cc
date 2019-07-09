@@ -398,7 +398,7 @@ bool TsdfServer::getNextPointcloudFromQueue(
     return true;
   } else {
     if (queue->size() >= kMaxQueueSize) {
-      ROS_ERROR_THROTTLE(60,
+      ROS_ERROR_THROTTLE(0.5,
                          "Input pointcloud queue getting too long! Dropping "
                          "some pointclouds. Either unable to look up transform "
                          "timestamps or the processing is taking too long.");
@@ -445,8 +445,11 @@ void TsdfServer::insertPointcloud(
     return;
   }
 
-  //Vinz: starting my part now 
+  //Vinz: starting my part now
+  timing::Timer total_process("total_dynamic_process");
+  timing::Timer clustering("cluster extraction");
   clustering_->addCurrentMap(tsdf_oneshot_map_);
+  clustering.Stop();
   dynamic_recognizer_->addCurrentMap(tsdf_oneshot_map_);
   dynamic_recognizing_active_ = false;
   //ROS_INFO("tsdf map queue size %u", dynamic_recognizer_->getMapQueueSize());
@@ -458,15 +461,21 @@ void TsdfServer::insertPointcloud(
   if (dynamic_recognizer_->getMapQueueSize() == dynamic_recognizer_queue_size_) {
     dynamic_recognizing_active_ = true;
     tsdf_map_delta_distance_.reset(new TsdfMap(tsdf_oneshot_map_->getTsdfLayer()));
+    timing::Timer dynamic_recognizing("dynamic recognizing");
     dynamic_recognizer_->dynamicRecognizing(clustering_->getCurrentClustersPointer(), tsdf_map_delta_distance_);
+    dynamic_recognizing.Stop();
     dynamic_recognizer_->dynamicClusterVisualiser(&dynamic_pcl_, &static_pcl_);
     dynamic_recognizer_->popfromQueue();
   }
+  timing::Timer cluster_matching("cluster matching");
   clustering_->matchCommunClusters();
+  cluster_matching.Stop();
   //clustered_pcl_ = clustering_->matchedClusterVisualiser();
+  timing::Timer pcl_generation("pcls generation");
   clustering_->mapClusterVisualiser(&dynamic_map_pcl_, &static_map_pcl_, tsdf_map_);
-  
+  pcl_generation.Stop();
   ROS_INFO("-----------------------");
+  total_process.Stop();
 
   if (publish_pointclouds_on_update_) {
     publishPointclouds();
