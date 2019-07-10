@@ -27,6 +27,7 @@ class Evaluator {
   unsigned long int not_found_static_points_;
   float found_static_share_;
   float not_found_static_share_;
+  float max_distance_threshold_ = 0.3;
 
   unsigned long int total_dynamic_points_;
   unsigned long int found_dynamic_points_;

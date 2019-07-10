@@ -42,21 +42,27 @@ namespace voxblox_eval {
   void Evaluator::staticMapCallback(const pcl::PointCloud<pcl::PointXYZRGB>& msg) {
     int total_static_points = 0;
     for (pcl::PointXYZRGB point : msg) {
+      float min_dist = 1000;
+      pcl::PointXYZRGB min_dist_ref_point;
       total_static_points++;
       bool found = false;
       bool already_seen = false;
       for (pcl::PointXYZRGB reference_point : reference_map_) {
-        if (point.x == reference_point.x && point.y == reference_point.y) {
-          for (pcl::PointXYZRGB seen_point : seen_points_map_) {
-            if (seen_point.x == reference_point.x && seen_point.y == reference_point.y) {
-              already_seen = true;
-            }
-          }
-          if (!already_seen) seen_points_map_.push_back(reference_point);
-          found = true;
-          //ROS_INFO("found");
-          break;
+        float point_dist = sqrt((point.x - reference_point.x)*(point.x - reference_point.x) + (point.y - reference_point.y)*(point.y - reference_point.y));
+        if (point_dist < min_dist) {
+          min_dist = point_dist;
+          min_dist_ref_point = reference_point;
         }
+      }
+      if (min_dist <= max_distance_threshold_){
+        for (pcl::PointXYZRGB seen_point : seen_points_map_) {
+          if (seen_point.x == min_dist_ref_point.x && seen_point.y == min_dist_ref_point.y) {
+            already_seen = true;
+          }
+        }
+        if (!already_seen) seen_points_map_.push_back(min_dist_ref_point);
+        found = true;
+        //ROS_INFO("found");
       }
       if (found) found_static_points_++;
       else not_found_static_points_++;
@@ -75,12 +81,16 @@ namespace voxblox_eval {
     int total_dynamic_points = 0;
     for (pcl::PointXYZRGB point : msg) {
       total_dynamic_points++;
+      float min_dist = 1000;
       bool found = false;
       for (pcl::PointXYZRGB reference_point : reference_map_) {
-        if (point.x == reference_point.x && point.y == reference_point.y) {
-          found = true;
-          break;
+        float point_dist = sqrt((point.x - reference_point.x)*(point.x - reference_point.x) + (point.y - reference_point.y)*(point.y - reference_point.y));
+        if (point_dist < min_dist) {
+          min_dist = point_dist;
         }
+      }
+      if (min_dist <= max_distance_threshold_) {
+        found = true;
       }
       if (found) found_dynamic_points_++;
       else not_found_dynamic_points_++;
