@@ -463,7 +463,7 @@ void TsdfServer::insertPointcloud(
     dynamic_recognizer_->popfromQueue();
   }
   clustering_->matchCommunClusters();
-  //clustered_pcl_ = clustering_->matchedClusterVisualiser();
+  clustered_pcl_ = clustering_->matchedClusterVisualiser();
   clustering_->mapClusterVisualiser(&dynamic_map_pcl_, &static_map_pcl_, tsdf_map_);
   
   ROS_INFO("-----------------------");

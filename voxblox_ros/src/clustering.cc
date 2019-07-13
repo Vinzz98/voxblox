@@ -262,12 +262,18 @@ void Clustering::matchCommunClusters() {
       current_color_cluster.index = base_map_color_cluster->index;
       current_color_cluster.color = base_map_color_cluster->color;
     }
-    if (base_map_color_cluster->dynamic) {
+    if (base_map_color_cluster->dynamic && !found) { //!found requirement new
       map_clusters_.remove(*base_map_color_cluster);
       current_color_cluster.dynamic = true;
       map_clusters_.push_back(current_color_cluster);
       seen_dynamic_indices.insert(current_color_cluster.index);
       continue;
+    }
+    //new TO TEST
+    else if (base_map_color_cluster->dynamic && found) {
+      current_color_cluster.dynamic = true;
+      map_clusters_.push_back(current_color_cluster);
+      seen_dynamic_indices.insert(current_color_cluster.index);
     }
     else base_map_color_cluster->dynamic = current_color_cluster.dynamic;
     for (GlobalIndex current_voxel : current_cluster) {
