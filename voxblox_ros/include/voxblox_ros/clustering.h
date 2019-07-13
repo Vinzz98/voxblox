@@ -43,6 +43,5 @@ class Clustering {
     std::list<int> used_indices_;
     int used_colors_ [8]; //colors.size - 1
     LongIndexSet current_FOV_voxels_;
-    //std::queue<std::list<ColoredDynamicCluster>> cluster_queue_ ;
 };
 } // end of namespace
